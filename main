@@ -1,0 +1,220 @@
+#include <string.h>
+#include <stdio.h>
+#include <unistd.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_log.h"
+#include "esp_system.h"
+
+#include "driver/adc.h"
+#include "esp_adc_cal.h"
+
+#include <uros_network_interfaces.h>
+#include <rcl/rcl.h>
+#include <rcl/error_handling.h>
+#include <geometry_msgs/msg/twist.h>
+#include <rclc/rclc.h>
+#include <rclc/executor.h>
+
+#ifdef CONFIG_MICRO_ROS_ESP_XRCE_DDS_MIDDLEWARE
+#include <rmw_microros/rmw_microros.h>
+#endif
+
+#define DEFAULT_VREF    1100        // Use adc2_vref_to_gpio() to obtain a better estimate
+#define NO_OF_SAMPLES   64          // Multisampling
+
+#define RCCHECK(fn) { rcl_ret_t temp_rc = fn; if((temp_rc != RCL_RET_OK)){printf("Failed status on line %d: %d. Aborting.\n",__LINE__,(int)temp_rc);vTaskDelete(NULL);}}
+#define RCSOFTCHECK(fn) { rcl_ret_t temp_rc = fn; if((temp_rc != RCL_RET_OK)){printf("Failed status on line %d: %d. Continuing.\n",__LINE__,(int)temp_rc);}}
+
+///////////////////////
+static const adc_channel_t thumb_1_channel = ADC1_CHANNEL_0;
+int mapped_thumb_1_value = 0;
+int raw_thumb_1_value = 0;
+int thumb_1_min = 4096;
+int thumb_1_max = 0;
+
+
+
+
+static const adc_channel_t thumb_2_channel = ADC1_CHANNEL_3;
+int mapped_thumb_2_value = 0;
+int raw_thumb_2_value = 0;
+int thumb_2_min = 4096;
+int thumb_2_max = 0;
+
+
+
+
+static const adc_channel_t index_channel = ADC1_CHANNEL_6;
+int mapped_index_value = 0;
+int raw_index_value = 0;
+int index_min = 4096;
+int index_max = 0;
+
+
+
+
+static const adc_channel_t ring_channel = ADC1_CHANNEL_7;
+int mapped_ring_value = 0;
+int raw_ring_value = 0;
+int ring_min = 4096;
+int ring_max = 0;
+
+
+
+
+static const adc_channel_t little_channel = ADC1_CHANNEL_4;
+int mapped_little_value = 0;
+int raw_little_value = 0;
+int little_min = 4096;
+int little_max = 0;
+
+
+
+
+static const adc_channel_t middle_channel = ADC1_CHANNEL_5;
+int mapped_middle_value = 0;
+int raw_middle_value = 0;
+int middle_min = 4096;
+int middle_max = 0;
+
+
+
+
+const int range_min = 0;
+const int range_max = 100;
+
+static const adc_atten_t atten = ADC_ATTEN_DB_11;
+static const adc_unit_t unit = ADC_UNIT_1;
+
+esp_adc_cal_characteristics_t *adc_chars;
+
+rcl_publisher_t publisher;
+geometry_msgs__msg__Twist msg;
+
+int constrain(int value, int min_range, int max_range) {
+   if (value < min_range) {
+       return min_range;
+   } else if (value > max_range) {
+       return max_range;
+   } else {
+       return value;
+   }
+}
+
+
+// Function to map the ADC value to the desired range
+int map_value(int value, int min_in, int max_in, int min_out, int max_out) {
+   int temp_value = (value - min_in) * (max_out - min_out) / (max_in - min_in) + min_out;
+   int mapped_value = constrain(temp_value ,min_out, max_out);
+   return mapped_value;
+}
+
+
+void timer_callback(rcl_timer_t * timer, int64_t last_call_time)
+{
+    RCLC_UNUSED(last_call_time);
+    if (timer != NULL) {
+        // msg.linear.x = adc1_get_raw((adc1_channel_t)little_channel); // Convert mV to V
+        // Read each potentiometer and map the value
+		raw_thumb_1_value = adc1_get_raw(thumb_1_channel);
+		mapped_thumb_1_value = map_value(raw_thumb_1_value, thumb_1_min, thumb_1_max, range_min, range_max);
+
+		raw_thumb_2_value = adc1_get_raw(thumb_2_channel);
+		mapped_thumb_2_value = map_value(raw_thumb_2_value, thumb_2_min, thumb_2_max, range_min, range_max);
+
+		raw_index_value = adc1_get_raw(index_channel);
+		mapped_index_value = map_value(raw_index_value, index_min, index_max, range_min, range_max);
+
+		raw_ring_value = adc1_get_raw(ring_channel);
+		mapped_ring_value = map_value(raw_ring_value, ring_min, ring_max, range_min, range_max);
+
+		raw_little_value = adc1_get_raw(little_channel);
+		mapped_little_value = map_value(raw_little_value, little_min, little_max, range_min, range_max);
+
+		raw_middle_value = adc1_get_raw(middle_channel);
+		mapped_middle_value = map_value(raw_middle_value, middle_min, middle_max, range_min, range_max);
+
+		// Assign the mapped values to the correct fields in the Twist message
+		msg.linear.x = mapped_thumb_1_value;   // Thumb 1 to linear.x
+		msg.linear.y = mapped_thumb_2_value;   // Thumb 2 to linear.y
+		msg.linear.z = mapped_index_value;     // Index to linear.z
+		msg.angular.x = mapped_ring_value;     // Ring to angular.x
+		msg.angular.y = mapped_little_value;   // Little to angular.y
+		msg.angular.z = mapped_middle_value;   // Middle to angular.z
+
+
+        printf("Publishing: linear x: %f, angular z: %f\n", msg.linear.x, msg.angular.z);
+        RCSOFTCHECK(rcl_publish(&publisher, &msg, NULL));
+    }
+}
+
+void micro_ros_task(void * arg)
+{
+    rcl_allocator_t allocator = rcl_get_default_allocator();
+    rclc_support_t support;
+
+    rcl_init_options_t init_options = rcl_get_zero_initialized_init_options();
+    RCCHECK(rcl_init_options_init(&init_options, allocator));
+
+#ifdef CONFIG_MICRO_ROS_ESP_XRCE_DDS_MIDDLEWARE
+    rmw_init_options_t* rmw_options = rcl_init_options_get_rmw_init_options(&init_options);
+    RCCHECK(rmw_uros_options_set_udp_address(CONFIG_MICRO_ROS_AGENT_IP, CONFIG_MICRO_ROS_AGENT_PORT, rmw_options));
+#endif
+
+    RCCHECK(rclc_support_init_with_options(&support, 0, NULL, &init_options, &allocator));
+
+    rcl_node_t node;
+    RCCHECK(rclc_node_init_default(&node, "esp32_twist_publisher", "", &support));
+
+    RCCHECK(rclc_publisher_init_default(
+        &publisher,
+        &node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Twist),
+        "cmd_vel"));
+
+    rcl_timer_t timer;
+    const unsigned int timer_timeout = 100;
+    RCCHECK(rclc_timer_init_default(
+        &timer,
+        &support,
+        RCL_MS_TO_NS(timer_timeout),
+        timer_callback));
+
+    rclc_executor_t executor;
+    RCCHECK(rclc_executor_init(&executor, &support.context, 1, &allocator));
+    RCCHECK(rclc_executor_add_timer(&executor, &timer));
+
+    memset(&msg, 0, sizeof(msg));
+
+    while(1){
+        rclc_executor_spin_some(&executor, RCL_MS_TO_NS(100));
+        usleep(1000);
+    }
+
+    RCCHECK(rcl_publisher_fini(&publisher, &node));
+    RCCHECK(rcl_node_fini(&node));
+
+    vTaskDelete(NULL);
+}
+
+void app_main(void)
+{
+#if defined(CONFIG_MICRO_ROS_ESP_NETIF_WLAN) || defined(CONFIG_MICRO_ROS_ESP_NETIF_ENET)
+    ESP_ERROR_CHECK(uros_network_interface_initialize());
+#endif
+
+    //Check if calibration data is burnt in eFuse
+    adc_chars = calloc(1, sizeof(esp_adc_cal_characteristics_t));
+    adc1_config_width(ADC_WIDTH_BIT_12);
+    adc1_config_channel_atten(thumb_1_channel, atten);
+	adc1_config_channel_atten(thumb_2_channel, atten);
+	adc1_config_channel_atten(index_channel, atten);
+	adc1_config_channel_atten(ring_channel, atten);
+	adc1_config_channel_atten(little_channel, atten);
+	adc1_config_channel_atten(middle_channel, atten);
+    esp_adc_cal_characterize(unit, atten, ADC_WIDTH_BIT_12, DEFAULT_VREF, adc_chars);
+
+    xTaskCreate(micro_ros_task, "uros_task", CONFIG_MICRO_ROS_APP_STACK, NULL, CONFIG_MICRO_ROS_APP_TASK_PRIO, NULL);
+}
